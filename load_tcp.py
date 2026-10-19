@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """
-Нагрузочный TCP-клиент для tcp_gateway (stdlib only).
+Нагрузочный TCP-клиент: 4000 уникальных IMEI (терминалы телематики).
+
+Модель нагрузки:
+  фиксированный пул терминалов; на каждой ступени они шлют всё чаще.
+  target_rps = num_imei / interval_sec
+  → 100 RPS  ≈ раз в 40 с
+  → 200 RPS  ≈ раз в 20 с
+  → …
+  → 4000 RPS ≈ раз в 1 с
 
 Запуск из корня репо при поднятом compose:
-  python load_tcp.py --rps 100 --duration 20
-  python load_tcp.py --ladder 100,500,1000,2500,5000 --duration 15 --concurrency 250
+  python load_tcp.py
+  python load_tcp.py --step-rps 100 --max-rps 4000 --duration 30
+  python load_tcp.py --ladder 100,500,1000,4000 --duration 20
 
 Смотри Grafana: TCP IoT Pipeline, и:
   curl -s localhost:8001/metrics | grep tcp_gateway_packets
@@ -15,9 +24,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import random
 import statistics
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 
 def crc16_modbus(data: bytes) -> int:
@@ -33,15 +44,33 @@ def crc16_modbus(data: bytes) -> int:
     return crc
 
 
-def build_ok_payload(imei: str) -> bytes:
+def build_payload(
+    imei: str,
+    *,
+    speed_can: int | None = None,
+    speed_engine: int | None = None,
+    dut_lvl: int | None = None,
+) -> bytes:
+    now = datetime.now(timezone.utc).strftime("%H-%M-%S")
+    speed_can = 50 + (speed_can if speed_can is not None else random.randint(0, 80))
+    speed_engine = (
+        800 + (speed_engine if speed_engine is not None else random.randint(0, 2200))
+    )
+    dut_lvl = dut_lvl if dut_lvl is not None else random.randint(0, 4095)
     body = (
         f"imei:{imei};"
-        f"datetime:12-00-00;"
-        f"speed_can:77;"
-        f"speed_engine:1500;"
-        f"dut_lvl:1024"
+        f"datetime:{now};"
+        f"speed_can:{speed_can};"
+        f"speed_engine:{speed_engine};"
+        f"dut_lvl:{dut_lvl}"
     ).encode()
     return body + f";crc16:{crc16_modbus(body)}".encode()
+
+
+def make_imei_pool(count: int, prefix: str) -> list[str]:
+    """Ровно `count` уникальных IMEI."""
+    width = max(4, len(str(count - 1)))
+    return [f"{prefix}{i:0{width}d}" for i in range(count)]
 
 
 @dataclass
@@ -50,16 +79,22 @@ class Stats:
     bad_ack: int = 0
     errors: int = 0
     latencies_ms: list[float] = field(default_factory=list)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    def add_ok(self, latency_ms: float) -> None:
-        self.ok += 1
-        self.latencies_ms.append(latency_ms)
+    async def add_ok(self, latency_ms: float) -> None:
+        async with self._lock:
+            self.ok += 1
+            # ограничиваем память на длинных прогонах
+            if len(self.latencies_ms) < 50_000:
+                self.latencies_ms.append(latency_ms)
 
-    def add_bad_ack(self) -> None:
-        self.bad_ack += 1
+    async def add_bad_ack(self) -> None:
+        async with self._lock:
+            self.bad_ack += 1
 
-    def add_error(self) -> None:
-        self.errors += 1
+    async def add_error(self) -> None:
+        async with self._lock:
+            self.errors += 1
 
 
 async def send_one(
@@ -86,59 +121,79 @@ async def send_one(
                 await writer.wait_closed()
             latency_ms = (time.perf_counter() - t0) * 1000
             if ack == b"'ack':'ok';":
-                stats.add_ok(latency_ms)
+                await stats.add_ok(latency_ms)
             else:
-                stats.add_bad_ack()
+                await stats.add_bad_ack()
         except Exception:
-            stats.add_error()
+            await stats.add_error()
 
 
-async def run_rps(
+async def terminal_loop(
+    *,
+    imei: str,
+    host: str,
+    port: int,
+    timeout: float,
+    stats: Stats,
+    sem: asyncio.Semaphore,
+    interval_holder: list[float],
+    stop_at: float,
+    phase_offset: float,
+) -> None:
+    """
+    Один терминал: шлёт пакет, затем спит interval_holder[0] секунд.
+    interval_holder — shared list, чтобы менять частоту на ступенях без пересоздания задач.
+    """
+    # размазываем первый тик по интервалу, иначе все 4000 ударят в одну секунду
+    await asyncio.sleep(phase_offset)
+    while time.perf_counter() < stop_at:
+        payload = build_payload(imei)
+        await send_one(host, port, payload, timeout, stats, sem)
+        interval = interval_holder[0]
+        remaining = stop_at - time.perf_counter()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(interval, remaining))
+
+
+async def run_stage(
     *,
     host: str,
     port: int,
-    rps: int,
+    imeis: list[str],
+    target_rps: int,
     duration: float,
     concurrency: int,
     timeout: float,
-    imei_prefix: str,
 ) -> Stats:
+    """
+    Все IMEI активны; интервал = len(imeis) / target_rps.
+    При 4000 IMEI и 100 RPS → каждый шлёт раз в 40 с; при 4000 RPS — раз в 1 с.
+    """
     stats = Stats()
     sem = asyncio.Semaphore(concurrency)
-    payload_cache: dict[str, bytes] = {}
-    interval = 1.0 / rps if rps > 0 else 0.0
-    deadline = time.perf_counter() + duration
-    seq = 0
-    pending: set[asyncio.Task[None]] = set()
+    n = len(imeis)
+    interval = n / target_rps if target_rps > 0 else float("inf")
+    interval_holder = [interval]
+    stop_at = time.perf_counter() + duration
 
-    def _on_done(task: asyncio.Task[None]) -> None:
-        pending.discard(task)
-
-    next_at = time.perf_counter()
-    while time.perf_counter() < deadline:
-        seq += 1
-        imei = f"{imei_prefix}{seq % 10_000:05d}"
-        payload = payload_cache.get(imei)
-        if payload is None:
-            payload = build_ok_payload(imei)
-            payload_cache[imei] = payload
-
-        task = asyncio.create_task(
-            send_one(host, port, payload, timeout, stats, sem)
+    tasks = [
+        asyncio.create_task(
+            terminal_loop(
+                imei=imei,
+                host=host,
+                port=port,
+                timeout=timeout,
+                stats=stats,
+                sem=sem,
+                interval_holder=interval_holder,
+                stop_at=stop_at,
+                phase_offset=(i / n) * interval if n and interval < float("inf") else 0.0,
+            )
         )
-        pending.add(task)
-        task.add_done_callback(_on_done)
-
-        next_at += interval
-        sleep_for = next_at - time.perf_counter()
-        if sleep_for > 0:
-            await asyncio.sleep(sleep_for)
-        else:
-            # отстаём от целевого RPS — не спим
-            next_at = time.perf_counter()
-
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
+        for i, imei in enumerate(imeis)
+    ]
+    await asyncio.gather(*tasks, return_exceptions=True)
     return stats
 
 
@@ -152,44 +207,64 @@ def _percentile(values: list[float], p: float) -> float:
     return ordered[idx]
 
 
-def print_stats(label: str, stats: Stats, duration: float) -> None:
+def print_stats(
+    label: str,
+    stats: Stats,
+    duration: float,
+    *,
+    target_rps: int,
+    num_imei: int,
+) -> None:
     total = stats.ok + stats.bad_ack + stats.errors
     achieved = stats.ok / duration if duration > 0 else 0.0
+    interval = num_imei / target_rps if target_rps > 0 else 0.0
     p50 = statistics.median(stats.latencies_ms) if stats.latencies_ms else 0.0
     p95 = _percentile(stats.latencies_ms, 95)
     print(
-        f"[{label}] total≈{total} ok={stats.ok} bad_ack={stats.bad_ack} "
-        f"err={stats.errors} | achieved≈{achieved:.0f} ok/s | "
+        f"[{label}] interval≈{interval:.2f}s/imei | "
+        f"total≈{total} ok={stats.ok} bad_ack={stats.bad_ack} err={stats.errors} | "
+        f"target={target_rps} achieved≈{achieved:.0f} ok/s | "
         f"lat_ms p50={p50:.1f} p95={p95:.1f}"
     )
 
 
-async def run(args: argparse.Namespace) -> int:
+def build_ladder(args: argparse.Namespace) -> list[int]:
     if args.ladder:
-        steps = [int(x.strip()) for x in args.ladder.split(",") if x.strip()]
-    else:
-        steps = [args.rps]
+        return [int(x.strip()) for x in args.ladder.split(",") if x.strip()]
+    return list(range(args.step_rps, args.max_rps + 1, args.step_rps))
+
+
+async def run(args: argparse.Namespace) -> int:
+    imeis = make_imei_pool(args.num_imei, args.imei_prefix)
+    steps = build_ladder(args)
 
     print(
-        f"target={args.host}:{args.port} concurrency={args.concurrency} "
-        f"timeout={args.timeout}s steps={steps} duration={args.duration}s"
+        f"target={args.host}:{args.port} imei={len(imeis)} "
+        f"concurrency={args.concurrency} timeout={args.timeout}s "
+        f"steps={steps[0]}..{steps[-1]} ({len(steps)} шт) duration={args.duration}s/step"
+    )
+    print(
+        "модель: все терминалы всегда онлайн; на ступени N RPS "
+        f"каждый шлёт раз в ≈{len(imeis)}/N секунд"
     )
 
     exit_code = 0
     for rps in steps:
         label = f"{rps}rps"
         t0 = time.perf_counter()
-        stats = await run_rps(
+        stats = await run_stage(
             host=args.host,
             port=args.port,
-            rps=rps,
+            imeis=imeis,
+            target_rps=rps,
             duration=args.duration,
             concurrency=args.concurrency,
             timeout=args.timeout,
-            imei_prefix=args.imei_prefix,
         )
         elapsed = time.perf_counter() - t0
-        print_stats(label, stats, elapsed)
+        print_stats(
+            label, stats, elapsed, target_rps=rps, num_imei=len(imeis)
+        )
         if stats.ok == 0 or stats.errors > max(1, int(stats.ok * 0.05)):
             exit_code = 1
         if args.pause > 0 and rps != steps[-1]:
@@ -200,26 +275,55 @@ async def run(args: argparse.Namespace) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Load TCP client for tcp_gateway (root of repo)"
+        description=(
+            "Load TCP: 4000 IMEI, частота растёт (раз в минуту → раз в секунду)"
+        )
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--rps", type=int, default=100, help="целевой RPS одной ступени")
+    parser.add_argument(
+        "--num-imei",
+        type=int,
+        default=4000,
+        help="число уникальных терминалов (IMEI)",
+    )
+    parser.add_argument(
+        "--step-rps",
+        type=int,
+        default=100,
+        help="шаг лестницы RPS (по умолчанию 100,200,...,max)",
+    )
+    parser.add_argument(
+        "--max-rps",
+        type=int,
+        default=4000,
+        help="верхняя ступень RPS",
+    )
     parser.add_argument(
         "--ladder",
         default="",
-        help="лестница RPS через запятую, напр. 100,500,1000,2500,5000",
+        help="явная лестница RPS через запятую (перебивает --step-rps/--max-rps)",
     )
     parser.add_argument(
         "--duration",
         type=float,
-        default=20.0,
+        default=30.0,
         help="длительность каждой ступени, сек",
     )
-    parser.add_argument("--concurrency", type=int, default=100)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=500,
+        help="макс. одновременных TCP-соединений",
+    )
     parser.add_argument("--timeout", type=float, default=5.0)
-    parser.add_argument("--imei-prefix", default="9")
-    parser.add_argument("--pause", type=float, default=2.0, help="пауза между ступенями")
+    parser.add_argument("--imei-prefix", default="86")
+    parser.add_argument(
+        "--pause",
+        type=float,
+        default=2.0,
+        help="пауза между ступенями, сек",
+    )
     args = parser.parse_args()
     raise SystemExit(asyncio.run(run(args)))
 

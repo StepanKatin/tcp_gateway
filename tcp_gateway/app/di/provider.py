@@ -45,8 +45,16 @@ class GatewayProvider(Provider):
 
     @provide(scope=Scope.APP)
     async def redis_broker(self, settings: Settings) -> AsyncIterator[RedisBroker]:
-        """Брокер для publish в Redis Stream."""
-        broker = RedisBroker(url=settings.redis_url)
+        """Брокер для publish в Redis Stream.
+
+        redis-py 8.x по умолчанию держит pool max_connections=100 и при
+        исчерпании бросает ConnectionError('Too many connections') вместо
+        ожидания — явно задаём лимит под нагрузку.
+        """
+        broker = RedisBroker(
+            url=settings.redis_url,
+            max_connections=settings.redis_max_connections,
+        )
         await broker.start()
         try:
             yield broker

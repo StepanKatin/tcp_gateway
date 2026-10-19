@@ -3,7 +3,16 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    command:
+      [
+        "redis-server",
+        "--save",
+        "",
+        "--appendonly",
+        "no",
+        "--maxclients",
+        "20000",
+      ]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -23,6 +32,7 @@ services:
       TCP_TIMEOUT: ${TCP_TIMEOUT:-60}
       REDIS_STREAM_NAME: ${REDIS_STREAM_NAME:-telemetry.points}
       REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-100000}
+      REDIS_MAX_CONNECTIONS: ${REDIS_MAX_CONNECTIONS:-512}
       HTTP_HOST: ${GATEWAY_HTTP_HOST:-0.0.0.0}
       HTTP_PORT: ${GATEWAY_HTTP_PORT:-8001}
       PYTHONPATH: /app/app
