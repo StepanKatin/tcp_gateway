@@ -1,0 +1,14 @@
+<clickhouse>
+  <!-- Official image locks default to localhost; open it for Docker network + host port-publish. -->
+  <users>
+    <default>
+      <password from_env="CLICKHOUSE_PASSWORD"/>
+      <networks>
+        <ip>::/0</ip>
+      </networks>
+      <profile>default</profile>
+      <quota>default</quota>
+      <access_management>1</access_management>
+    </default>
+  </users>
+</clickhouse>

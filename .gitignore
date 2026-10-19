@@ -1,0 +1,61 @@
+# Secrets / local env (keep *.example in git)
+.env
+**/.env
+!.env.example
+!**/.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache/
+coverage.xml
+*.cover
+
+# Typecheck / linters
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / local runtime
+*.log
+logs/
+
+# Local Docker / Compose overrides (optional machine-specific)
+docker-compose.override.yml
+
+# ClickHouse / local data dumps (if ever created outside volumes)
+*.tsv
+*.csv.gz
